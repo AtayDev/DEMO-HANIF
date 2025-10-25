@@ -1,7 +1,6 @@
-import os, hashlib, json, time, requests, shelve
+import os, hashlib, time
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor
+from typing import List, Tuple, Dict
 
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from werkzeug.utils import secure_filename
@@ -10,69 +9,110 @@ from dotenv import load_dotenv
 import pdfplumber
 import docx
 import tiktoken
-import chromadb
-from chromadb.config import Settings
+
+# LangChain imports
+from langchain_community.vectorstores import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+from datetime import datetime
+
+
+def tprint(*args, **kwargs):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ", *args, **kwargs)
+
 
 # =========================
-# Config & paths
+# Config
 # =========================
 load_dotenv()
 
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./storage/chroma")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./storage/uploads")
 FLASK_SECRET = os.getenv("FLASK_SECRET", "dev-secret")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "global_knowledge")
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.1")
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "gemini").lower()
 
-# Context / generation budgets
+# Provider keys and models
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
+GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash")
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_EMBED_MODEL = os.getenv("DEEPSEEK_EMBED_MODEL", "deepseek-embedding")
+DEEPSEEK_CHAT_MODEL = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
+
+# Chunking / RAG settings
+CHUNK_TOKENS = int(os.getenv("CHUNK_TOKENS", "600"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
+TOP_K = int(os.getenv("TOP_K", "4"))
+FETCH_K = int(os.getenv("FETCH_K", "20"))
+MMR_LAMBDA = float(os.getenv("MMR_LAMBDA", "0.4"))
 CONTEXT_MAX_TOKENS = int(os.getenv("CONTEXT_MAX_TOKENS", "1200"))
 ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "256"))
 
-# Parallel embedding workers
-EMBED_THREADS = int(os.getenv("EMBED_THREADS", "4"))
-
 Path(CHROMA_DIR).mkdir(parents=True, exist_ok=True)
 Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
-
 ALLOWED_EXTS = {".pdf", ".docx", ".txt"}
 
-# Manifest (avoid re-indexing identical files)
-MANIFEST_PATH = Path(CHROMA_DIR) / "manifest.json"
-if not MANIFEST_PATH.exists():
-    MANIFEST_PATH.write_text("{}", encoding="utf-8")
-
-# On-disk embedding cache
-CACHE_PATH = str(Path(CHROMA_DIR) / "emb_cache.db")
-
-# Flask app
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
-
-# Persistent Chroma client
-chroma_client = chromadb.PersistentClient(
-    path=CHROMA_DIR,
-    settings=Settings(anonymized_telemetry=False)
-)
-
-# Tokenizer
 _enc = tiktoken.get_encoding("cl100k_base")
 
-# =========================
-# Small utils
-# =========================
-def load_manifest() -> Dict[str, Dict]:
-    try:
-        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
-def save_manifest(m: Dict[str, Dict]) -> None:
-    MANIFEST_PATH.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+# =========================
+# Embedding + Chat factories
+# =========================
+def make_embeddings():
+    if LLM_PROVIDER == "openai":
+        return OpenAIEmbeddings(api_key=OPENAI_API_KEY, model=OPENAI_EMBED_MODEL)
+    elif LLM_PROVIDER == "gemini":
+        model = GEMINI_EMBED_MODEL if GEMINI_EMBED_MODEL.startswith("models/") else f"models/{GEMINI_EMBED_MODEL}"
+        return GoogleGenerativeAIEmbeddings(google_api_key=GOOGLE_API_KEY, model=model)
+    elif LLM_PROVIDER == "deepseek":
+        return OpenAIEmbeddings(api_key=DEEPSEEK_API_KEY, model=DEEPSEEK_EMBED_MODEL, base_url=f"{DEEPSEEK_BASE_URL}/v1")
+    raise RuntimeError(f"Unsupported provider {LLM_PROVIDER}")
 
-def allowed_file(filename: str) -> bool:
-    return Path(filename).suffix.lower() in ALLOWED_EXTS
+
+def make_chat():
+    if LLM_PROVIDER == "openai":
+        return ChatOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_CHAT_MODEL, temperature=0.1)
+    elif LLM_PROVIDER == "gemini":
+        return ChatGoogleGenerativeAI(google_api_key=GOOGLE_API_KEY, model=GEMINI_CHAT_MODEL, temperature=0.1)
+    elif LLM_PROVIDER == "deepseek":
+        return ChatOpenAI(api_key=DEEPSEEK_API_KEY, base_url=f"{DEEPSEEK_BASE_URL}/v1",
+                          model=DEEPSEEK_CHAT_MODEL, temperature=0.1)
+    raise RuntimeError(f"Unsupported provider {LLM_PROVIDER}")
+
+
+# Lazy load
+_EMB, _LLM = None, None
+def EMB():
+    global _EMB
+    if _EMB is None: _EMB = make_embeddings()
+    return _EMB
+
+def LLM():
+    global _LLM
+    if _LLM is None: _LLM = make_chat()
+    return _LLM
+
+
+# =========================
+# File utilities
+# =========================
+def allowed_file(fn: str) -> bool:
+    return Path(fn).suffix.lower() in ALLOWED_EXTS
+
 
 def file_sha256(p: Path) -> str:
     h = hashlib.sha256()
@@ -81,9 +121,7 @@ def file_sha256(p: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-# =========================
-# File readers & chunking
-# =========================
+
 def read_pdf(path: Path) -> Tuple[str, List[str]]:
     pages = []
     with pdfplumber.open(str(path)) as pdf:
@@ -92,303 +130,169 @@ def read_pdf(path: Path) -> Tuple[str, List[str]]:
             pages.append(t)
     return "\n".join(pages), pages
 
+
 def read_docx(path: Path) -> str:
     d = docx.Document(str(path))
-    paras = [p.text for p in d.paragraphs]
-    return "\n".join([p for p in paras if p.strip()])
+    return "\n".join([p.text for p in d.paragraphs if p.text.strip()])
+
 
 def read_txt(path: Path) -> str:
     return path.read_text(errors="ignore")
 
-def chunk_tokenwise(text: str, max_tokens=900, overlap=150) -> List[str]:
+
+def split_tokens(text: str, max_tokens=600, overlap=120) -> List[str]:
     toks = _enc.encode(text)
-    chunks, start, n = [], 0, len(toks)
-    while start < n:
-        end = min(n, start + max_tokens)
-        chunk = _enc.decode(toks[start:end]).strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= n:
-            break
-        start = max(0, end - overlap)
+    chunks, i, n = [], 0, len(toks)
+    while i < n:
+        j = min(n, i + max_tokens)
+        seg = _enc.decode(toks[i:j]).strip()
+        if seg:
+            chunks.append(seg)
+        i = max(0, j - overlap)
+        if j >= n: break
     return chunks
 
-def map_pages_to_chunks(per_page_texts: List[str], max_tokens=900, overlap=150):
-    if not per_page_texts:
-        return [], []
-    chunks, spans = [], []
-    for page_idx, page_text in enumerate(per_page_texts, start=1):
-        page_chunks = chunk_tokenwise(page_text, max_tokens=max_tokens, overlap=overlap)
-        for ch in page_chunks:
-            chunks.append(ch)
-            spans.append((page_idx, page_idx))
-    return chunks, spans
 
-def trim_to_token_limit(texts: List[str], max_total_tokens: int) -> List[str]:
+# =========================
+# Vectorstore (global)
+# =========================
+def vectorstore() -> Chroma:
+    return Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=EMB(),
+        persist_directory=CHROMA_DIR
+    )
+
+
+def add_documents(vs: Chroma, docs: List[Document], batch_size: int = 64):
+    for start in range(0, len(docs), batch_size):
+        batch = docs[start:start + batch_size]
+        ids = [f"{d.metadata['sha']}::{int(time.time()*1e6)}::{i}" for i, d in enumerate(batch)]
+        vs.add_documents(batch, ids=ids)
+    vs.persist()
+
+
+# =========================
+# Chunking per file type
+# =========================
+def chunk_file(path: Path, filename: str, sha: str) -> List[Document]:
+    suffix = path.suffix.lower()
+    docs = []
+    if suffix == ".pdf":
+        _, pages = read_pdf(path)
+        for pageno, text in enumerate(pages, 1):
+            for i, chunk in enumerate(split_tokens(text, CHUNK_TOKENS, CHUNK_OVERLAP)):
+                docs.append(Document(page_content=chunk, metadata={"filename": filename, "sha": sha,
+                                                                  "page_start": pageno, "page_end": pageno,
+                                                                  "chunk_index": i}))
+    elif suffix == ".docx":
+        text = read_docx(path)
+        for i, chunk in enumerate(split_tokens(text, CHUNK_TOKENS, CHUNK_OVERLAP)):
+            docs.append(Document(page_content=chunk, metadata={"filename": filename, "sha": sha,
+                                                              "page_start": -1, "page_end": -1,
+                                                              "chunk_index": i}))
+    else:
+        text = read_txt(path)
+        for i, chunk in enumerate(split_tokens(text, CHUNK_TOKENS, CHUNK_OVERLAP)):
+            docs.append(Document(page_content=chunk, metadata={"filename": filename, "sha": sha,
+                                                              "page_start": -1, "page_end": -1,
+                                                              "chunk_index": i}))
+    return docs
+
+
+# =========================
+# Prompt / RAG
+# =========================
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are a careful assistant. Only answer using facts from the provided context."),
+    ("human", "Question:\n{question}\n\nContext:\n{context}\n\nAnswer:")
+])
+
+
+def trim_to_token_limit(texts: List[str], max_total_tokens: int):
     kept, used = [], 0
     for t in texts:
         nt = len(_enc.encode(t))
         if used + nt > max_total_tokens:
-            if not kept and nt > max_total_tokens:
-                # take a head if the first block is too big
-                head = _enc.decode(_enc.encode(t)[:max_total_tokens])
-                kept.append(head)
             break
         kept.append(t)
         used += nt
     return kept
 
-# =========================
-# Ollama (embeddings & chat)
-# =========================
-def _embed_one(text: str) -> List[float]:
-    # Retry on transient failures
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                f"{OLLAMA_BASE_URL}/api/embeddings",
-                json={"model": OLLAMA_EMBEDDING_MODEL, "prompt": text},
-                timeout=120
-            )
-            if r.status_code != 200:
-                raise RuntimeError(r.text)
-            return r.json()["embedding"]
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(0.8 * (attempt + 1))
-    raise RuntimeError("Embedding failed after retries")
 
-def embed_ollama(texts: List[str]) -> List[List[float]]:
-    if not texts:
-        return []
-    out = [None] * len(texts)
-    with shelve.open(CACHE_PATH) as db:
-        # gather non-cached jobs
-        jobs = []
-        with ThreadPoolExecutor(max_workers=EMBED_THREADS) as ex:
-            for i, t in enumerate(texts):
-                key = hashlib.sha256((OLLAMA_EMBEDDING_MODEL + "||" + t).encode("utf-8")).hexdigest()
-                if key in db:
-                    out[i] = db[key]
-                else:
-                    jobs.append((i, key, ex.submit(_embed_one, t)))
-            for i, key, fut in jobs:
-                v = fut.result()
-                db[key] = v
-                out[i] = v
-    return out  # type: ignore
-
-def chat_ollama(system_prompt: str, user_prompt: str) -> str:
-    payload = {
-        "model": OLLAMA_CHAT_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "stream": False,
-        "options": {
-            "num_predict": ANSWER_MAX_TOKENS,
-            "temperature": 0.1,
-            "top_k": 30,
-            "num_ctx": 2048,
-            "repeat_penalty": 1.05
-        }
-    }
-    for attempt in range(3):
-        r = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=180)
-        if r.status_code == 200:
-            return r.json().get("message", {}).get("content", "").strip()
-        if attempt == 2:
-            raise RuntimeError(f"Ollama chat error: {r.text}")
-        time.sleep(0.8 * (attempt + 1))
-    return ""
-
-# =========================
-# Chroma helpers
-# =========================
-def collection_for(client_id: str):
-    name = f"client__{client_id}"
-    try:
-        return chroma_client.get_collection(name=name)
-    except Exception:
-        return chroma_client.create_collection(name=name, metadata={"hnsw:space": "cosine"})
-
-def upsert_chunks(client_id: str, sha: str, filename: str,
-                  chunks: List[str], spans: List[Tuple[Optional[int], Optional[int]]]):
-    col = collection_for(client_id)
-    ids = [f"{sha}::chunk::{i}" for i in range(len(chunks))]
-    metas = []
-    for i, (ps, pe) in enumerate(spans):
-        metas.append({
-            "filename": filename,
-            "sha": sha,
-            "chunk_index": i,
-            "page_start": ps,
-            "page_end": pe
-        })
-    # explicit embeddings (parallelized + cached)
-    embs = embed_ollama(chunks)
-    col.upsert(ids=ids, documents=chunks, embeddings=embs, metadatas=metas)
-
-def build_context_blocks(hits: Dict) -> List[str]:
-    docs = hits.get("documents") or []
-    metas = hits.get("metadatas") or []
-
-    if docs and isinstance(docs[0], list):
-        docs = docs[0]
-    if metas and isinstance(metas[0], list):
-        metas = metas[0]
-
+def blocks_from_docs(docs: List[Document]) -> List[str]:
     blocks = []
-    for i in range(min(len(docs), len(metas))):
-        doc  = (docs[i] or "").strip()
-        meta = metas[i] or {}
-        if not doc:
-            continue
-        fn = meta.get("filename", "unknown")
-        ps = meta.get("page_start")
-        pe = meta.get("page_end")
-        pg = (f"pages {ps}" if ps == pe else f"pages {ps}-{pe}") if (ps and pe) else "pages n/a"
-        idx = meta.get("chunk_index", "n/a")
-        blocks.append(f"{doc}\n[Source: {fn}, {pg}, chunk {idx}]")
+    for doc in docs:
+        md = doc.metadata
+        fn = md.get("filename", "?")
+        pg = md.get("page_start", -1)
+        blk = f"{doc.page_content}\n[Source: {fn}, page {pg}]"
+        blocks.append(blk)
     return blocks
 
-def format_prompt(question: str, context_blocks: List[str]) -> Tuple[str, str]:
-    trimmed = trim_to_token_limit(context_blocks, CONTEXT_MAX_TOKENS)
-    context_text = "\n\n---\n\n".join(trimmed)
-    system = (
-        "You are a careful assistant. Answer ONLY with facts from the provided Context.\n"
-        "If the Context is insufficient, say you don't know.\n"
-        "Be concise. Include inline citations like [Source: filename, pages, chunk N] when relevant."
-    )
-    user = f"Question:\n{question}\n\nContext:\n{context_text}\n\nAnswer:"
-    return system, user
 
-# =========================
-# RAG core (EXHAUSTIVE SEARCH BY DEFAULT)
-# =========================
-def rag_answer(client_id: str, question: str) -> Dict:
-    col = collection_for(client_id)
+def rag_answer(question: str) -> Dict:
+    vs = vectorstore()
+    retriever = vs.as_retriever(search_type="mmr",
+                                search_kwargs={"k": TOP_K, "fetch_k": FETCH_K, "lambda_mult": MMR_LAMBDA})
+    docs = retriever.invoke(question)
+    if not docs:
+        return {"answer": "No relevant information found.", "contexts": []}
 
-    # 1) embed question
-    qvec = embed_ollama([question])[0]
+    blocks = blocks_from_docs(docs)
+    context_text = "\n\n---\n\n".join(trim_to_token_limit(blocks, CONTEXT_MAX_TOKENS))
+    chain = PROMPT | LLM() | StrOutputParser()
+    answer = chain.invoke({"question": question, "context": context_text}).strip()
+    return {"answer": answer, "contexts": blocks[:min(5, len(blocks))]}
 
-    # 2) EXHAUSTIVE: ask Chroma for ALL chunks in this client's collection
-    try:
-        total = col.count()  # number of vectors (chunks)
-    except Exception:
-        total = 50  # fallback if count unavailable
-    n_results = max(1, total)
-
-    hits = col.query(
-        query_embeddings=[qvec],
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"]
-    )
-
-    print("--------HITS------>", hits)
-
-    if not hits.get("documents") or not hits["documents"][0]:
-        return {"answer": "I couldn't find anything in the uploaded documents.", "contexts": []}
-
-    # 3) light rerank by distance (cosine -> lower is better)
-    docs  = hits["documents"][0]
-    metas = hits["metadatas"][0]
-    dists = hits.get("distances", [[0] * len(docs)])[0]
-    order = sorted(range(len(docs)), key=lambda i: dists[i])
-    docs  = [docs[i] for i in order]
-    metas = [metas[i] for i in order]
-    re_hits = {"documents": [docs], "metadatas": [metas]}
-
-    # 4) build prompt (with citations) + trim to context budget
-    blocks = build_context_blocks(re_hits)
-    system, user = format_prompt(question, blocks)
-
-    # 5) generate
-    answer = chat_ollama(system, user)
-    return {"answer": answer, "contexts": blocks[: min(5, len(blocks))]}
 
 # =========================
 # Routes
 # =========================
 @app.get("/")
 def index():
-    client = request.args.get("client", "default")
-    files = [p.name for p in Path(UPLOAD_DIR).glob("*") if p.is_file()]
-    return render_template("index.html", client=client, files=files)
+    files = [p.name for p in Path(UPLOAD_DIR).glob("*")]
+    return render_template("index.html", files=files)
+
 
 @app.post("/upload")
 def upload():
-    client = request.form.get("client", "default")
     f = request.files.get("file")
     if not f or f.filename == "":
-        flash("No file selected", "error"); return redirect(url_for("index", client=client))
+        flash("No file selected", "error")
+        return redirect(url_for("index"))
     if not allowed_file(f.filename):
-        flash("Unsupported file type. Use PDF, DOCX, or TXT.", "error"); return redirect(url_for("index", client=client))
+        flash("Invalid file type", "error")
+        return redirect(url_for("index"))
 
     filename = secure_filename(f.filename)
     dest = Path(UPLOAD_DIR) / filename
     f.save(dest)
     sha = file_sha256(dest)
-
-    # Skip if already indexed with same embedding model
-    manifest = load_manifest()
-    already = manifest.get(sha)
-    if already and already.get("filename") == filename and already.get("embed_model") == OLLAMA_EMBEDDING_MODEL:
-        flash(f"Skipped: {filename} already indexed (sha: {sha[:8]}…)", "ok")
-        return redirect(url_for("index", client=client))
+    tprint(f"Processing file {filename} (sha={sha[:8]}…)")
 
     try:
-        suffix = dest.suffix.lower()
-        if suffix == ".pdf":
-            _, per_page = read_pdf(dest)
-            chunks, spans = map_pages_to_chunks(per_page, 900, 150)
-            if not chunks:  # fallback if PDF text empty
-                text = dest.read_text(errors="ignore")
-                chunks = chunk_tokenwise(text, 900, 150)
-                spans = [(None, None)] * len(chunks)
-        elif suffix == ".docx":
-            text = read_docx(dest)
-            chunks = chunk_tokenwise(text, 900, 150)
-            spans = [(None, None)] * len(chunks)
-        else:  # .txt
-            text = read_txt(dest)
-            chunks = chunk_tokenwise(text, 900, 150)
-            spans = [(None, None)] * len(chunks)
-
-        if not chunks:
-            flash("The document appears empty after parsing.", "error")
-            return redirect(url_for("index", client=client))
-
-        upsert_chunks(client, sha, filename, chunks, spans)
-
-        manifest[sha] = {
-            "filename": filename,
-            "embed_model": OLLAMA_EMBEDDING_MODEL,
-            "chunks": len(chunks),
-            "ingested_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
-        save_manifest(manifest)
-
-        flash(f"Uploaded & indexed: {filename} ({len(chunks)} chunks)", "ok")
+        docs = chunk_file(dest, filename, sha)
+        vs = vectorstore()
+        add_documents(vs, docs)
+        flash(f"Uploaded & indexed: {filename} ({len(docs)} chunks)", "ok")
     except Exception as e:
-        flash(f"Failed to ingest: {e}", "error")
-    return redirect(url_for("index", client=client))
+        flash(f"Error indexing file: {e}", "error")
+
+    return redirect(url_for("index"))
+
 
 @app.post("/api/chat")
 def api_chat():
-    client = request.args.get("client", "default")
-    data = request.get_json(silent=True) or {}
-    q = (data.get("q") or "").strip()
+    q = (request.get_json(silent=True) or {}).get("q", "").strip()
     if not q:
         return jsonify({"answer": "Please provide a question."})
     try:
-        result = rag_answer(client, q)  # exhaustive by default
-        return jsonify({"answer": result["answer"], "contexts": result.get("contexts", [])})
+        result = rag_answer(q)
+        return jsonify(result)
     except Exception as e:
-        return jsonify({"answer": f"Error: {e}"}), 500
+        return jsonify({"answer": f"Error: {e}", "contexts": []}), 500
+
 
 if __name__ == "__main__":
-    # Run: python app.py  → http://localhost:8000
     app.run(host="0.0.0.0", port=8000, debug=True)
