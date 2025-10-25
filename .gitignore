@@ -1,4 +1,3 @@
-storage/
 # Environment variables
 .env
 .env.local
